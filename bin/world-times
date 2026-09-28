@@ -1,0 +1,392 @@
+#!/usr/bin/env python3
+"""Current local times for a range of world cities, as JSON.
+
+Feeds the uptime-clock widget's right-click "world times" panel
+(bar/modules/uptime.qml). Entries are sorted alphabetically by city, with
+the machine's own timezone flagged `local`. Runs once per second while the
+panel is open, so a fresh python spawn is cheap and there is no state to go
+stale.
+
+Output schema:
+  {"local": "<IANA zone>", "entries": [
+    {"city": str, "zone": str, "time": "HH:MM:SS", "day": "Mon",
+     "offset": "UTC-5"/"UTC+5:30"}, ...
+  ]}
+
+Subcommands (for adding cities beyond the curated list):
+  (no args)          current times for curated + custom cities
+  search <query>     fuzzy-match IANA timezones, emit {"matches":[...]}
+  add <zone> [label]   persist a custom city (zone label = leaf unless given)
+  remove <zone>?     remove a custom city by exact IANA zone
+
+Custom cities persist in world-times-custom.json next to this script, merged
+into the canonical output (labelled as-is, still sorted and local-tagged).
+"""
+
+import json
+import pathlib
+import subprocess
+import sys
+import unicodedata
+from datetime import datetime
+
+try:
+    from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+    import zoneinfo
+except ImportError:  # python < 3.9
+    sys.stderr.write("world-times: zoneinfo (python 3.9+) required\n")
+    sys.exit(2)
+
+# (label, IANA zone). Coverage spans UTC-11 .. UTC+14; several zones are
+# shared by more than one city (Mumbai/Kolkata, Rio/Sao Paulo) on purpose.
+_CITIES = [
+    ("Adelaide", "Australia/Adelaide"),
+    ("Anchorage", "America/Anchorage"),
+    ("Apia", "Pacific/Apia"),
+    ("Athens", "Europe/Athens"),
+    ("Auckland", "Pacific/Auckland"),
+    ("Baghdad", "Asia/Baghdad"),
+    ("Baku", "Asia/Baku"),
+    ("Bangkok", "Asia/Bangkok"),
+    ("Beijing", "Asia/Shanghai"),
+    ("Berlin", "Europe/Berlin"),
+    ("Bogotá", "America/Bogota"),
+    ("Brisbane", "Australia/Brisbane"),
+    ("Bucharest", "Europe/Bucharest"),
+    ("Buenos Aires", "America/Argentina/Buenos_Aires"),
+    ("Cairo", "Africa/Cairo"),
+    ("Caracas", "America/Caracas"),
+    ("Casablanca", "Africa/Casablanca"),
+    ("Chatham Islands", "Pacific/Chatham"),
+    ("Chicago", "America/Chicago"),
+    ("Copenhagen", "Europe/Copenhagen"),
+    ("Darwin", "Australia/Darwin"),
+    ("Denver", "America/Denver"),
+    ("Dhaka", "Asia/Dhaka"),
+    ("Dubai", "Asia/Dubai"),
+    ("Dublin", "Europe/Dublin"),
+    ("Guatemala City", "America/Guatemala"),
+    ("Halifax", "America/Halifax"),
+    ("Ho Chi Minh City", "Asia/Ho_Chi_Minh"),
+    ("Hong Kong", "Asia/Hong_Kong"),
+    ("Honolulu", "Pacific/Honolulu"),
+    ("Istanbul", "Europe/Istanbul"),
+    ("Jakarta", "Asia/Jakarta"),
+    ("Jerusalem", "Asia/Jerusalem"),
+    ("Johannesburg", "Africa/Johannesburg"),
+    ("Karachi", "Asia/Karachi"),
+    ("Kathmandu", "Asia/Kathmandu"),
+    ("Kiritimati", "Pacific/Kiritimati"),
+    ("Kolkata", "Asia/Kolkata"),
+    ("Kuala Lumpur", "Asia/Kuala_Lumpur"),
+    ("Kuwait City", "Asia/Kuwait"),
+    ("Kyiv", "Europe/Kyiv"),
+    ("Lagos", "Africa/Lagos"),
+    ("Lima", "America/Lima"),
+    ("Lisbon", "Europe/Lisbon"),
+    ("London", "Europe/London"),
+    ("Los Angeles", "America/Los_Angeles"),
+    ("Madrid", "Europe/Madrid"),
+    ("Manila", "Asia/Manila"),
+    ("Melbourne", "Australia/Melbourne"),
+    ("Mexico City", "America/Mexico_City"),
+    ("Moscow", "Europe/Moscow"),
+    ("Mumbai", "Asia/Kolkata"),
+    ("Nairobi", "Africa/Nairobi"),
+    ("New York", "America/New_York"),
+    ("Nuuk", "America/Nuuk"),
+    ("Oslo", "Europe/Oslo"),
+    ("Paris", "Europe/Paris"),
+    ("Perth", "Australia/Perth"),
+    ("Prague", "Europe/Prague"),
+    ("Reykjavík", "Atlantic/Reykjavik"),
+    ("Rio de Janeiro", "America/Sao_Paulo"),
+    ("Rome", "Europe/Rome"),
+    ("São Paulo", "America/Sao_Paulo"),
+    ("Santiago", "America/Santiago"),
+    ("Seoul", "Asia/Seoul"),
+    ("Singapore", "Asia/Singapore"),
+    ("Stockholm", "Europe/Stockholm"),
+    ("Suva", "Pacific/Fiji"),
+    ("Sydney", "Australia/Sydney"),
+    ("Taipei", "Asia/Taipei"),
+    ("Tehran", "Asia/Tehran"),
+    ("Tokyo", "Asia/Tokyo"),
+    ("Toronto", "America/Toronto"),
+    ("Ulaanbaatar", "Asia/Ulaanbaatar"),
+    ("Vancouver", "America/Vancouver"),
+    ("Vienna", "Europe/Vienna"),
+    ("Warsaw", "Europe/Warsaw"),
+    ("Yangon", "Asia/Yangon"),
+    ("Zagreb", "Europe/Zagreb"),
+    ("Zurich", "Europe/Zurich"),
+]
+
+_ENTRIES = dict(_CITIES)
+_TZ_INDEX = {zone: label for label, zone in _CITIES}
+
+
+def local_zone():
+    """The machine's IANA timezone via /etc/localtime, timedatectl as fallback."""
+    try:
+        link = str(pathlib.Path("/etc/localtime").readlink())
+    except (OSError, ValueError):
+        link = ""
+    if link.startswith("/usr/share/zoneinfo/"):
+        return link[len("/usr/share/zoneinfo/"):]
+    try:
+        out = subprocess.run(
+            ["timedatectl", "show", "-p", "Timezone", "--value"],
+            capture_output=True, text=True, timeout=2,
+        )
+        zone = out.stdout.strip()
+        if zone and "/" in zone:
+            return zone
+    except (OSError, subprocess.SubprocessError):
+        pass
+    return ""
+
+
+def city_label(zone):
+    """Leaf of a zone path — America/Argentina/Buenos_Aires -> Buenos Aires."""
+    leaf = zone.rsplit("/", 1)[-1].replace("_", " ")
+    return leaf if leaf and leaf != zone else zone
+
+
+def custom_path():
+    """User-picked cities live beside this script, so they follow the widget."""
+    return pathlib.Path(__file__).resolve().parent / "world-times-custom.json"
+
+
+def load_custom():
+    """[(label, IANA zone)] from world-times-custom.json, validated."""
+    try:
+        data = json.loads(custom_path().read_text())
+    except (OSError, ValueError):
+        return []
+    items = data.get("zones") if isinstance(data, dict) else data
+    out = []
+    for it in items or []:
+        try:
+            zone = str(it["zone"])
+            ZoneInfo(zone)  # drop anything stale or malformed
+        except (KeyError, TypeError, ZoneInfoNotFoundError, ValueError):
+            continue
+        label = str(it.get("label") or city_label(zone))
+        out.append((label, zone))
+    return out
+
+
+def save_custom(items):
+    custom_path().write_text(json.dumps({
+        "zones": [{"label": label, "zone": zone} for label, zone in items]
+    }, indent=2) + "\n")
+
+
+# Pseudo-regions that are offsets or zones, not places - skip in city search.
+_SEARCH_SKIP_PREFIXES = ("Etc/", "posix/", "right/")
+
+
+def _panel_zones():
+    """All IANA zones already shown in the panel (curated or user-added)."""
+    return {zone for _, zone in _panel_entries()}
+
+
+def _panel_entries():
+    """[(display label, IANA zone)] for everything already in the panel."""
+    return _CITIES + load_custom()
+
+
+def _zone_score(q, zone):
+    """0=exact, 1=prefix-ish, 2=contains, 3=all tokens present; None if no match."""
+    human = zone.replace("_", " ")
+    hq, zq = human.casefold(), zone.casefold()
+    if hq == q or zq == q:
+        return 0
+    if hq.startswith(q) or zq.endswith(q) or zq.startswith(q):
+        return 1
+    if q in hq or q in zq:
+        return 2
+    if all(token in hq for token in q.split()):
+        return 3
+    return None
+
+
+def search_zones(query):
+    """Top IANA zone matches for a fuzzy city/region query, minus any that are
+    already in the panel (curated or custom), so matches read as add-candidates."""
+    q = query.strip().casefold()
+    if not q:
+        return []
+    existing = _panel_zones()
+    scored = []
+    for zone in sorted(zoneinfo.available_timezones()):
+        if zone in existing or zone.startswith(_SEARCH_SKIP_PREFIXES):
+            continue
+        score = _zone_score(q, zone)
+        if score is None:
+            continue
+        scored.append((score, len(zone), zone))
+    scored.sort()
+    seen, out = set(), []
+    for _, _, zone in scored:
+        label = city_label(zone)
+        if label.casefold() in seen:
+            continue
+        seen.add(label.casefold())
+        out.append({"label": label, "zone": zone})
+        if len(out) >= 12:
+            break
+    return out
+
+
+def already_zones(query):
+    """Panel display labels this query would have matched, so the UI can say
+    "X is already in your list" instead of a bare no-match."""
+    q = query.strip().casefold()
+    if not q:
+        return []
+    scored = []
+    for label, zone in _panel_entries():
+        score = _zone_score(q, zone)
+        if score is None:
+            continue
+        scored.append((score, len(zone.casefold()), label))
+    scored.sort()
+    seen, out = set(), []
+    for _, _, label in scored:
+        if label.casefold() in seen:
+            continue
+        seen.add(label.casefold())
+        out.append(label)
+        if len(out) >= 3:
+            break
+    return out
+
+
+def offset_label(now):
+    secs = round(now.utcoffset().total_seconds())
+    sign = "+" if secs >= 0 else "-"
+    secs = abs(secs)
+    h, m = divmod(secs // 60, 60)
+    if h == 0 and m == 0:
+        return "UTC"
+    if m:
+        return "UTC%s%d:%02d" % (sign, h, m)
+    return "UTC%s%d" % (sign, h)
+
+
+def build_entry(label, zone, now, is_local):
+    zoned = now.astimezone(ZoneInfo(zone))
+    return {
+        "city": label,
+        "zone": zone,
+        "time": zoned.strftime("%H:%M:%S"),
+        "day": zoned.strftime("%a"),
+        "offset": offset_label(zoned),
+        "local": is_local,
+    }
+
+
+def sort_key(entry):
+    # Strip accents (NFD) before comparing, so "São Paulo" sorts as
+    # "Sao Paulo" next to its unaccented neighbours rather than at the end.
+    norm = "".join(ch for ch in unicodedata.normalize("NFD", entry["city"])
+                   if unicodedata.category(ch) != "Mn")
+    return norm.casefold()
+
+
+def main():
+    zone = local_zone()
+    now = datetime.now().astimezone()
+
+    pairs = list(_CITIES)
+    seen = {tz for _, tz in pairs}
+    for label, tz in load_custom():
+        if tz in seen:
+            continue
+        pairs.append((label, tz))
+        seen.add(tz)
+
+    entries = []
+    local_marked = False
+    for label, tz in pairs:
+        is_local = (not local_marked) and (tz == zone)
+        if is_local:
+            local_marked = True
+        try:
+            entries.append(build_entry(label, tz, now, is_local))
+        except (ZoneInfoNotFoundError, ValueError):
+            continue
+
+    # A custom zone not on the curated list still gets shown and highlighted.
+    if not local_marked and zone:
+        try:
+            entries.append(build_entry(city_label(zone), zone, now, True))
+            local_marked = True
+        except (ZoneInfoNotFoundError, ValueError):
+            pass
+
+    entries.sort(key=sort_key)
+
+    json.dump({"local": zone, "entries": entries}, sys.stdout)
+    sys.stdout.write("\n")
+
+
+def cmd_add(args):
+    zone = args[0] if args else ""
+    try:
+        ZoneInfo(zone)
+    except (ZoneInfoNotFoundError, ValueError):
+        json.dump({"ok": False, "error": "unknown timezone: " + zone}, sys.stdout)
+        sys.stdout.write("\n")
+        return 3
+    if any(tz == zone for _, tz in _CITIES):
+        json.dump({"ok": True, "label": city_label(zone), "zone": zone,
+                   "note": "already in the curated list"}, sys.stdout)
+        sys.stdout.write("\n")
+        return 0
+    items = load_custom()
+    if any(tz == zone for _, tz in items):
+        json.dump({"ok": True, "label": city_label(zone), "zone": zone,
+                   "note": "already added"}, sys.stdout)
+        sys.stdout.write("\n")
+        return 0
+    label = args[1].strip() if len(args) > 1 and args[1].strip() else city_label(zone)
+    items.append((label, zone))
+    save_custom(items)
+    json.dump({"ok": True, "label": label, "zone": zone, "total": len(items)},
+              sys.stdout)
+    sys.stdout.write("\n")
+    return 0
+
+
+def cmd_remove(args):
+    zone = args[0] if args else ""
+    items = [(label, tz) for label, tz in load_custom() if tz != zone]
+    keep = [it for it in load_custom() if it[1] == zone]
+    if not keep:
+        json.dump({"ok": True, "removed": False, "zone": zone}, sys.stdout)
+    else:
+        save_custom(items)
+        json.dump({"ok": True, "removed": True, "zone": zone,
+                   "label": keep[0][0], "total": len(items)}, sys.stdout)
+    sys.stdout.write("\n")
+    return 0
+
+
+if __name__ == "__main__":
+    cmd = sys.argv[1] if len(sys.argv) > 1 else None
+    if cmd == "search":
+        query = " ".join(sys.argv[2:]).strip()
+        json.dump({"matches": search_zones(query), "already": already_zones(query)}, sys.stdout)
+        sys.stdout.write("\n")
+    elif cmd == "add":
+        sys.exit(cmd_add(sys.argv[2:]))
+    elif cmd == "remove":
+        sys.exit(cmd_remove(sys.argv[2:]))
+    elif cmd is None:
+        main()
+    else:
+        sys.stderr.write("world-times: unknown subcommand " + cmd + "\n")
+        sys.exit(2)

@@ -1,0 +1,22 @@
+{
+  "schemaVersion": 1,
+  "id": "robbie.worldtime",
+  "name": "World Times",
+  "version": "1.0.0",
+  "author": "robbie",
+  "license": "MIT",
+  "description": "Bar clock with six switchable formats and a searchable, scrollable world-times panel you can add cities to",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "Panel.qml"
+  },
+  "barWidget": {
+    "displayName": "World Times",
+    "description": "Bar clock (click to cycle format, right-click for the panel) with a searchable list of world clocks, plus IANA timezone search to add new cities.",
+    "category": "Info",
+    "allowMultiple": false,
+    "defaultSection": "left"
+  }
+}
